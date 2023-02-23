@@ -69,11 +69,8 @@ def get_conf_from_evn():
         conf["SPARK_EXTRA_CONF_PATH"] = os.getenv(
             "SPARK_EXTRA_CONF_PATH", default=""
         )  # [AICNS-61]
-        conf["start"] = pendulum.parse(start_datetime).in_timezone(conf["APP_TIMEZONE"])
-        conf["end"] = pendulum.parse(end_datetime).in_timezone(conf["APP_TIMEZONE"])
-
-        # todo: temp patch for day resolution parsing, so later with [AICNS-59] resolution will be subdivided.
-        conf["end"] = conf["end"].subtract(minutes=1)
+        conf["start"] = pendulum.parse(start_datetime, tz=conf["APP_TIMEZONE"])
+        conf["end"] = pendulum.parse(end_datetime, tz=conf["APP_TIMEZONE"])
 
     except Exception as e:
         print(e)
@@ -104,14 +101,28 @@ def parse_spark_extra_conf(app_conf):
 def load_raw_data(app_conf, feature, time_col_name, data_col_name):
     loader: RawDataLoader = DatePartitionedRawDataLoader()
     loader.prepare_to_load(**app_conf)
+    # [AICNS-153] Additional fetch for timezone
     feature_raw_df = (
         loader.load_feature_data_by_object(
-            start=app_conf["start"], end=app_conf["end"], feature=feature
+            start=app_conf["start"].subtract(days=1), end=app_conf["end"].subtract(minutes=1), feature=feature
         )
         .select(time_col_name, data_col_name)
         .sort(time_col_name)
     )
-    return feature_raw_df
+    return __filter_by_timestamp(feature_raw_df, app_conf["start"], app_conf["end"], time_col_name)
+
+
+def __filter_by_timestamp(raw_df: DataFrame, start, end, time_col_name) -> DataFrame:
+    """
+
+    :param raw_df:
+    :param start:
+    :param end:
+    :return:
+    """
+    return raw_df.filter(
+        f"({time_col_name} >= {start.int_timestamp * 1000}) and ({time_col_name} < {end.int_timestamp * 1000})").sort(
+        time_col_name)
 
 
 def mock_validate(ts: DataFrame, time_col_name: str) -> AnalysisReport:
@@ -126,18 +137,19 @@ def mock_validate(ts: DataFrame, time_col_name: str) -> AnalysisReport:
     return report
 
 
-def append_partition_cols(ts: DataFrame, time_col_name: str, data_col_name):
-    return (
-        ts.withColumn("datetime", F.from_unixtime(F.col(time_col_name) / 1000))
+def append_partition_cols(ts: DataFrame, time_col_name: str, data_col_name, tz):
+    SparkSession.getActiveSession().conf.set("spark.sql.session.timeZone", tz)
+    partitioned = ts.withColumn("datetime", F.from_unixtime(F.col(time_col_name) / 1000)) \
         .select(
             time_col_name,
             data_col_name,
             F.year("datetime").alias("year"),
             F.month("datetime").alias("month"),
             F.dayofmonth("datetime").alias("day"),
-        )
+        ) \
         .sort(time_col_name)
-    )
+    SparkSession.getActiveSession().conf.unset("spark.sql.session.timeZone")
+    return partitioned
 
 
 def save_validated_data_to_dwh(
@@ -155,7 +167,7 @@ def save_validated_data_to_dwh(
     period = pendulum.period(app_conf["start"], app_conf["end"])
 
     # Create partition columns(year, month, day) from timestamp
-    partition_df = append_partition_cols(ts, time_col_name, data_col_name)
+    partition_df = append_partition_cols(ts, time_col_name, data_col_name, app_conf['APP_TIMEZONE'])
 
     for date in period.range("days"):
         # Drop Partition for immutable task
